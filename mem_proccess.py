@@ -23,6 +23,7 @@ import threading
 import time
 import gc
 import subprocess
+from collections import deque
 
 import dearpygui.dearpygui as dpg
 import psutil
@@ -34,6 +35,10 @@ from ctypes import wintypes
 
 # --- Configuration ---
 config_path = os.path.join(os.path.dirname(__file__), 'mem_proccess_config.json')
+
+# runtime history and state
+_mem_history = deque()
+_last_autoclean_time = 0.0
 
 
 def set_autostart(enable: bool) -> bool:
@@ -158,7 +163,17 @@ Write-Host 'Memory cleanup completed'
 
 def save_config(autostart: bool):
 	try:
-		data = {'autostart': bool(autostart)}
+		# gather other UI-driven config values if available
+		data = {
+			'autostart': bool(autostart),
+			'accent_color': dpg.get_value('accent_color_picker') if dpg.does_item_exist('accent_color_picker') else [100,200,255,255],
+			'update_interval': float(dpg.get_value('update_interval_input')) if dpg.does_item_exist('update_interval_input') else 1.0,
+			'auto_cleanup': bool(dpg.get_value('auto_cleanup_checkbox')) if dpg.does_item_exist('auto_cleanup_checkbox') else False,
+			'auto_cleanup_threshold': int(dpg.get_value('auto_cleanup_threshold')) if dpg.does_item_exist('auto_cleanup_threshold') else 90,
+			'notify_on_cleanup': bool(dpg.get_value('notify_on_cleanup')) if dpg.does_item_exist('notify_on_cleanup') else True,
+			'history_seconds': int(dpg.get_value('history_seconds')) if dpg.does_item_exist('history_seconds') else 60,
+			'top_n_processes': int(dpg.get_value('top_n_processes')) if dpg.does_item_exist('top_n_processes') else 5,
+		}
 		with open(config_path, 'w', encoding='utf-8') as f:
 			json.dump(data, f, ensure_ascii=False, indent=2)
 	except Exception as e:
@@ -166,7 +181,16 @@ def save_config(autostart: bool):
 
 
 def load_config() -> dict:
-	defaults = {'autostart': False}
+	defaults = {
+		'autostart': False,
+		'accent_color': [100, 200, 255, 255],
+		'update_interval': 1.0,
+		'auto_cleanup': False,
+		'auto_cleanup_threshold': 90,
+		'notify_on_cleanup': True,
+		'history_seconds': 60,
+		'top_n_processes': 5,
+	}
 	try:
 		if os.path.exists(config_path):
 			with open(config_path, 'r', encoding='utf-8') as f:
@@ -180,6 +204,7 @@ def load_config() -> dict:
 
 
 def update_loop(stop_event: threading.Event):
+	# dynamic update loop using ui-configurable interval, history and auto-cleanup
 	while not stop_event.is_set():
 		try:
 			mem = psutil.virtual_memory()
@@ -188,13 +213,54 @@ def update_loop(stop_event: threading.Event):
 			swap_text = f"Paging File: {swap.used / (1024**3):.2f} GB / {swap.total / (1024**3):.2f} GB ({swap.percent:.1f}%)"
 			ram_val = min(mem.percent / 100.0, 1.0)
 			swap_val = min(swap.percent / 100.0, 1.0)
+
+			# write texts
 			try:
 				dpg.set_value('ram_text', ram_text)
 				dpg.set_value('swap_text', swap_text)
-				dpg.set_value('ram_bar', ram_val)
-				dpg.set_value('swap_bar', swap_val)
 			except Exception:
 				pass
+
+			# draw custom colored bars (green/yellow/red)
+			try:
+				def color_for(pct):
+					if pct < 60:
+						return (80, 200, 120, 255)
+					if pct < 85:
+						return (240, 200, 80, 255)
+					return (220, 80, 80, 255)
+
+				w = 440
+				h = 18
+				# remove previous foreground rects if present
+				try:
+					if dpg.does_item_exist('ram_fore'):
+						dpg.delete_item('ram_fore')
+				except Exception:
+					pass
+				try:
+					if dpg.does_item_exist('swap_fore'):
+						dpg.delete_item('swap_fore')
+				except Exception:
+					pass
+
+				# draw background then foreground
+				try:
+					dpg.draw_rectangle((0, 0), (w, h), color=(60,60,60,255), fill=(40,40,40,255), parent='ram_draw', tag='ram_back')
+					fw = int(w * ram_val)
+					if fw > 0:
+						dpg.draw_rectangle((0, 0), (fw, h), color=color_for(mem.percent), fill=color_for(mem.percent), parent='ram_draw', tag='ram_fore')
+				except Exception:
+					pass
+
+				try:
+					dpg.draw_rectangle((0, 0), (w, h), color=(60,60,60,255), fill=(40,40,40,255), parent='swap_draw', tag='swap_back')
+					fw2 = int(w * swap_val)
+					if fw2 > 0:
+						dpg.draw_rectangle((0, 0), (fw2, h), color=color_for(swap.percent), fill=color_for(swap.percent), parent='swap_draw', tag='swap_fore')
+				except Exception:
+					pass
+
 			# update tray icon image if available
 			try:
 				if '_GLOBAL_TRAY_ICON' in globals() and _GLOBAL_TRAY_ICON:
@@ -202,17 +268,73 @@ def update_loop(stop_event: threading.Event):
 						img = create_tray_icon(mem.percent)
 						_GLOBAL_TRAY_ICON.icon = img
 						try:
-							# some pystray backends expose update_icon
 							_GLOBAL_TRAY_ICON.update_icon()
 						except Exception:
 							pass
+				except Exception:
+					pass
+
+			# maintain history for simple sparkline
+			try:
+				history_seconds = dpg.get_value('history_seconds') if dpg.does_item_exist('history_seconds') else 60
+				interval = dpg.get_value('update_interval_input') if dpg.does_item_exist('update_interval_input') else 1.0
+				maxlen = max(10, int(history_seconds / max(0.1, float(interval))))
+				_mem_history.append(mem.percent)
+				while len(_mem_history) > maxlen:
+					_mem_history.popleft()
+				# make a small sparkline using 8 levels
+				levels = '▁▂▃▄▅▆▇█'
+				line = ''.join(levels[min(len(levels)-1, int((v/100.0)*(len(levels)-1)))] for v in _mem_history)
+				dpg.set_value('history_text', f"History ({len(_mem_history)}s): {line}")
+			except Exception:
+				pass
+
+			# update processes list
+			try:
+				top_n = dpg.get_value('top_n_processes') if dpg.does_item_exist('top_n_processes') else 5
+				procs = []
+				for p in psutil.process_iter(['pid','name','memory_info']):
+					try:
+						mi = p.info.get('memory_info')
+						rss = getattr(mi, 'rss', 0) if mi else 0
+						procs.append((rss, p.info.get('name') or ''))
+				except Exception:
+					continue
+				procs.sort(reverse=True)
+				for i in range(min(10, max(1, top_n))):
+					try:
+						if i < len(procs):
+							rss, name = procs[i]
+							s = f"{i+1}. {name} — {rss/(1024**2):.1f} MB"
+							dpg.set_value(f'proc_row_{i}', s)
+						else:
+							dpg.set_value(f'proc_row_{i}', '')
 					except Exception:
 						pass
 			except Exception:
 				pass
+
+			# Auto-cleanup when threshold reached (with simple cooldown)
+			try:
+				if dpg.does_item_exist('auto_cleanup_checkbox') and dpg.get_value('auto_cleanup_checkbox'):
+					threshold = dpg.get_value('auto_cleanup_threshold') if dpg.does_item_exist('auto_cleanup_threshold') else 90
+					now = time.time()
+					global _last_autoclean_time
+					if mem.percent >= float(threshold) and now - _last_autoclean_time > max(30.0, float(interval)*5):
+						_last_autoclean_time = now
+						threading.Thread(target=lambda: _autoclean_and_notify(), daemon=True).start()
+			except Exception:
+				pass
+
 		except Exception:
 			pass
-		stop_event.wait(1.0)
+
+		# wait for configured interval
+		try:
+			interval = float(dpg.get_value('update_interval_input')) if dpg.does_item_exist('update_interval_input') else 1.0
+		except Exception:
+			interval = 1.0
+		stop_event.wait(max(0.1, interval))
 
 
 # Global tray icon instance
@@ -383,6 +505,27 @@ def setup_tray():
 		return None
 
 
+def _autoclean_and_notify():
+	"""Call cleanup_memory and show an in-app notification if enabled."""
+	try:
+		res = cleanup_memory()
+		# show transient notification in GUI if requested
+		try:
+			if dpg.does_item_exist('notify_on_cleanup') and dpg.get_value('notify_on_cleanup'):
+				if dpg.does_item_exist('notify_win'):
+					dpg.delete_item('notify_win')
+				dpg.add_window(label='Notification', tag='notify_win', pos=(260, 20), width=200, height=60, no_close=True)
+				dpg.add_text('Memory cleaned', parent='notify_win')
+				# schedule removal
+				threading.Timer(4.0, lambda: dpg.delete_item('notify_win') if dpg.does_item_exist('notify_win') else None).start()
+		except Exception:
+			pass
+		return res
+	except Exception as e:
+		print(f'_autoclean_and_notify error: {e}')
+		return False
+
+
 def run_tray(tray_icon):
 	"""Run tray icon in separate thread"""
 	try:
@@ -438,17 +581,18 @@ def main():
 			with dpg.tab(label='Main'):
 				dpg.add_spacer(height=5)
 				dpg.add_text('', tag='ram_text', color=(100, 200, 255))
-				dpg.add_progress_bar(tag='ram_bar', width=440, default_value=0.0)
+				# custom drawing bar so we can change color dynamically
+				dpg.add_drawing(tag='ram_draw', width=440, height=18)
 				dpg.add_spacer(height=8)
 				dpg.add_text('', tag='swap_text', color=(100, 200, 255))
-				dpg.add_progress_bar(tag='swap_bar', width=440, default_value=0.0)
+				dpg.add_drawing(tag='swap_draw', width=440, height=18)
 				dpg.add_spacer(height=12)
-				
+				# History sparkline (text-based for compatibility)
+				dpg.add_text('', tag='history_text', color=(200,200,200))
 				# Clear Memory button
 				with dpg.group(horizontal=True):
 					dpg.add_spacer(width=130)
 					dpg.add_button(label='Clear Memory', width=180, height=32, callback=lambda: threading.Thread(target=cleanup_memory, daemon=True).start())
-				
 				# License text
 				dpg.add_spacer(height=6)
 				dpg.add_text('License: Free distribution', color=(160, 160, 160))
@@ -458,6 +602,28 @@ def main():
 				dpg.add_text('System', color=(200, 200, 200))
 				dpg.add_separator()
 				dpg.add_checkbox(label='Autostart on System Boot', tag='autostart_checkbox', default_value=cfg.get('autostart', False), callback=lambda s, v: set_autostart(v))
+				dpg.add_spacing(count=1)
+				dpg.add_text('Appearance', color=(200,200,200))
+				dpg.add_color_picker4(tag='accent_color_picker', label='Accent Color', default_value=cfg.get('accent_color', [100,200,255,255]), width=200)
+				dpg.add_spacing(count=1)
+				dpg.add_text('Update', color=(200,200,200))
+				dpg.add_input_float(tag='update_interval_input', label='Update interval (s)', default_value=cfg.get('update_interval', 1.0), min_value=0.1, step=0.1)
+				dpg.add_spacing(count=1)
+				dpg.add_text('Auto Cleanup', color=(200,200,200))
+				dpg.add_checkbox(tag='auto_cleanup_checkbox', label='Enable auto cleanup', default_value=cfg.get('auto_cleanup', False))
+				dpg.add_slider_int(tag='auto_cleanup_threshold', label='Cleanup threshold (%)', default_value=cfg.get('auto_cleanup_threshold', 90), min_value=10, max_value=100)
+				dpg.add_checkbox(tag='notify_on_cleanup', label='Notify on cleanup', default_value=cfg.get('notify_on_cleanup', True))
+				dpg.add_spacing(count=1)
+				dpg.add_text('History / Processes', color=(200,200,200))
+				dpg.add_input_int(tag='history_seconds', label='History length (s)', default_value=cfg.get('history_seconds', 60), min_value=10, max_value=3600)
+				dpg.add_input_int(tag='top_n_processes', label='Top N processes', default_value=cfg.get('top_n_processes', 5), min_value=1, max_value=50)
+				dpg.add_spacing(count=1)
+				dpg.add_button(label='Save settings', callback=lambda: save_config(dpg.get_value('autostart_checkbox') if dpg.does_item_exist('autostart_checkbox') else False))
+				
+			with dpg.tab(label='Processes', tag='processes_tab'):
+				dpg.add_text('Top memory consuming processes:', color=(220,220,220))
+				for i in range(10):
+					dpg.add_text('', tag=f'proc_row_{i}')
 
 	dpg.setup_dearpygui()
 	dpg.set_primary_window('main_window', True)

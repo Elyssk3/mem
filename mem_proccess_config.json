@@ -1,3 +1,8 @@
 {
-  "autostart": false
+  "autostart": false,
+  "theme": "green",
+  "auto_clean_enabled": false,
+  "auto_clean_threshold": 0,
+  "auto_clean_period_enabled": false,
+  "auto_clean_period_minutes": 60
 }

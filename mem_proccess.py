@@ -23,7 +23,6 @@ import threading
 import time
 import gc
 import subprocess
-from collections import deque
 
 import dearpygui.dearpygui as dpg
 import psutil
@@ -36,9 +35,15 @@ from ctypes import wintypes
 # --- Configuration ---
 config_path = os.path.join(os.path.dirname(__file__), 'mem_proccess_config.json')
 
-# runtime history and state
-_mem_history = deque()
-_last_autoclean_time = 0.0
+# Auto-clean globals
+AUTO_CLEAN_THRESHOLD = 0
+AUTO_CLEAN_ENABLED = False
+LAST_AUTO_CLEAN = 0.0
+AUTO_CLEAN_COOLDOWN = 300.0  # seconds between automatic cleans
+# Periodic auto-clean globals
+AUTO_CLEAN_PERIOD_ENABLED = False
+AUTO_CLEAN_PERIOD_MINUTES = 60
+LAST_PERIODIC_CLEAN = 0.0
 
 
 def set_autostart(enable: bool) -> bool:
@@ -161,18 +166,15 @@ Write-Host 'Memory cleanup completed'
 		return False
 
 
-def save_config(autostart: bool):
+def save_config(autostart: bool, theme: str = 'blue', auto_clean_enabled: bool = False, auto_clean_threshold: int = 0, auto_clean_period_enabled: bool = False, auto_clean_period_minutes: int = 60):
 	try:
-		# gather other UI-driven config values if available
 		data = {
 			'autostart': bool(autostart),
-			'accent_color': dpg.get_value('accent_color_picker') if dpg.does_item_exist('accent_color_picker') else [100,200,255,255],
-			'update_interval': float(dpg.get_value('update_interval_input')) if dpg.does_item_exist('update_interval_input') else 1.0,
-			'auto_cleanup': bool(dpg.get_value('auto_cleanup_checkbox')) if dpg.does_item_exist('auto_cleanup_checkbox') else False,
-			'auto_cleanup_threshold': int(dpg.get_value('auto_cleanup_threshold')) if dpg.does_item_exist('auto_cleanup_threshold') else 90,
-			'notify_on_cleanup': bool(dpg.get_value('notify_on_cleanup')) if dpg.does_item_exist('notify_on_cleanup') else True,
-			'history_seconds': int(dpg.get_value('history_seconds')) if dpg.does_item_exist('history_seconds') else 60,
-			'top_n_processes': int(dpg.get_value('top_n_processes')) if dpg.does_item_exist('top_n_processes') else 5,
+			'theme': str(theme),
+			'auto_clean_enabled': bool(auto_clean_enabled),
+			'auto_clean_threshold': int(auto_clean_threshold),
+			'auto_clean_period_enabled': bool(auto_clean_period_enabled),
+			'auto_clean_period_minutes': int(auto_clean_period_minutes)
 		}
 		with open(config_path, 'w', encoding='utf-8') as f:
 			json.dump(data, f, ensure_ascii=False, indent=2)
@@ -183,13 +185,11 @@ def save_config(autostart: bool):
 def load_config() -> dict:
 	defaults = {
 		'autostart': False,
-		'accent_color': [100, 200, 255, 255],
-		'update_interval': 1.0,
-		'auto_cleanup': False,
-		'auto_cleanup_threshold': 90,
-		'notify_on_cleanup': True,
-		'history_seconds': 60,
-		'top_n_processes': 5,
+		'theme': 'blue',
+		'auto_clean_enabled': False,
+		'auto_clean_threshold': 0,
+		'auto_clean_period_enabled': False,
+		'auto_clean_period_minutes': 60,
 	}
 	try:
 		if os.path.exists(config_path):
@@ -203,8 +203,107 @@ def load_config() -> dict:
 	return defaults
 
 
+def create_themes():
+	"""Create color themes for the application"""
+	themes = {}
+	
+	# Green theme
+	theme_green = dpg.add_theme(tag='theme_green')
+	with dpg.theme_component(dpg.mvAll, parent=theme_green):
+		dpg.add_theme_color(dpg.mvThemeCol_WindowBg, (30, 40, 30))
+		dpg.add_theme_color(dpg.mvThemeCol_Button, (60, 100, 60))
+		dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered, (80, 120, 80))
+		dpg.add_theme_color(dpg.mvThemeCol_ButtonActive, (90, 140, 90))
+		dpg.add_theme_color(dpg.mvThemeCol_FrameBg, (45, 55, 45))
+		dpg.add_theme_color(dpg.mvThemeCol_Text, (150, 200, 150))
+		dpg.add_theme_color(dpg.mvThemeCol_TabHovered, (80, 120, 80))
+		dpg.add_theme_color(dpg.mvThemeCol_TabActive, (90, 140, 90))
+		dpg.add_theme_color(dpg.mvThemeCol_CheckMark, (90, 160, 90))
+		dpg.add_theme_color(dpg.mvThemeCol_PlotHistogram, (150, 150, 150))
+		dpg.add_theme_color(dpg.mvThemeCol_PlotHistogramHovered, (150, 150, 150))
+		dpg.add_theme_color(dpg.mvThemeCol_SliderGrab, (150, 150, 150))
+		dpg.add_theme_color(dpg.mvThemeCol_SliderGrabActive, (150, 150, 150))
+	themes['green'] = theme_green
+	
+	# Purple theme
+	theme_purple = dpg.add_theme(tag='theme_purple')
+	with dpg.theme_component(dpg.mvAll, parent=theme_purple):
+		dpg.add_theme_color(dpg.mvThemeCol_WindowBg, (45, 35, 55))
+		dpg.add_theme_color(dpg.mvThemeCol_Button, (110, 60, 125))
+		dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered, (125, 85, 145))
+		dpg.add_theme_color(dpg.mvThemeCol_ButtonActive, (140, 95, 160))
+		dpg.add_theme_color(dpg.mvThemeCol_FrameBg, (55, 45, 65))
+		dpg.add_theme_color(dpg.mvThemeCol_Text, (190, 150, 210))
+		dpg.add_theme_color(dpg.mvThemeCol_TabHovered, (125, 85, 145))
+		dpg.add_theme_color(dpg.mvThemeCol_TabActive, (140, 95, 160))
+		dpg.add_theme_color(dpg.mvThemeCol_CheckMark, (150, 100, 170))
+		dpg.add_theme_color(dpg.mvThemeCol_PlotHistogram, (150, 150, 150))
+		dpg.add_theme_color(dpg.mvThemeCol_PlotHistogramHovered, (150, 150, 150))
+		dpg.add_theme_color(dpg.mvThemeCol_SliderGrab, (150, 150, 150))
+		dpg.add_theme_color(dpg.mvThemeCol_SliderGrabActive, (150, 150, 150))
+	themes['purple'] = theme_purple
+	
+	# Blue theme (default)
+	theme_blue = dpg.add_theme(tag='theme_blue')
+	with dpg.theme_component(dpg.mvAll, parent=theme_blue):
+		dpg.add_theme_color(dpg.mvThemeCol_WindowBg, (35, 40, 48))
+		dpg.add_theme_color(dpg.mvThemeCol_Button, (60, 90, 120))
+		dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered, (75, 110, 140))
+		dpg.add_theme_color(dpg.mvThemeCol_ButtonActive, (90, 130, 160))
+		dpg.add_theme_color(dpg.mvThemeCol_FrameBg, (45, 50, 62))
+		dpg.add_theme_color(dpg.mvThemeCol_Text, (160, 180, 210))
+		dpg.add_theme_color(dpg.mvThemeCol_TabHovered, (75, 110, 140))
+		dpg.add_theme_color(dpg.mvThemeCol_TabActive, (90, 130, 160))
+		dpg.add_theme_color(dpg.mvThemeCol_CheckMark, (100, 150, 190))
+		dpg.add_theme_color(dpg.mvThemeCol_PlotHistogram, (150, 150, 150))
+		dpg.add_theme_color(dpg.mvThemeCol_PlotHistogramHovered, (150, 150, 150))
+		dpg.add_theme_color(dpg.mvThemeCol_SliderGrab, (150, 150, 150))
+		dpg.add_theme_color(dpg.mvThemeCol_SliderGrabActive, (150, 150, 150))
+	themes['blue'] = theme_blue
+	
+	# Yellow theme
+	theme_yellow = dpg.add_theme(tag='theme_yellow')
+	with dpg.theme_component(dpg.mvAll, parent=theme_yellow):
+		dpg.add_theme_color(dpg.mvThemeCol_WindowBg, (55, 50, 36))
+		dpg.add_theme_color(dpg.mvThemeCol_Button, (150, 115, 50))
+		dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered, (175, 140, 70))
+		dpg.add_theme_color(dpg.mvThemeCol_ButtonActive, (190, 155, 80))
+		dpg.add_theme_color(dpg.mvThemeCol_FrameBg, (62, 58, 44))
+		dpg.add_theme_color(dpg.mvThemeCol_Text, (210, 190, 120))
+		dpg.add_theme_color(dpg.mvThemeCol_TabHovered, (175, 140, 70))
+		dpg.add_theme_color(dpg.mvThemeCol_TabActive, (190, 155, 80))
+		dpg.add_theme_color(dpg.mvThemeCol_CheckMark, (200, 170, 80))
+		dpg.add_theme_color(dpg.mvThemeCol_PlotHistogram, (150, 150, 150))
+		dpg.add_theme_color(dpg.mvThemeCol_PlotHistogramHovered, (150, 150, 150))
+		dpg.add_theme_color(dpg.mvThemeCol_SliderGrab, (150, 150, 150))
+		dpg.add_theme_color(dpg.mvThemeCol_SliderGrabActive, (150, 150, 150))
+	themes['yellow'] = theme_yellow
+	
+	return themes
+
+
+def apply_theme(theme_name: str, themes: dict):
+	"""Apply selected theme to the application"""
+	try:
+		if theme_name in themes:
+			dpg.bind_theme(themes[theme_name])
+			print(f'Applied theme: {theme_name}')
+			cfg = load_config()
+			cfg['theme'] = theme_name
+			save_config(
+				cfg.get('autostart', False),
+				theme_name,
+				cfg.get('auto_clean_enabled', False),
+				cfg.get('auto_clean_threshold', 0),
+				cfg.get('auto_clean_period_enabled', False),
+				cfg.get('auto_clean_period_minutes', 60),
+			)
+	except Exception as e:
+		print(f'apply_theme error: {e}')
+
+
 def update_loop(stop_event: threading.Event):
-	# dynamic update loop using ui-configurable interval, history and auto-cleanup
+	global AUTO_CLEAN_ENABLED, AUTO_CLEAN_THRESHOLD, LAST_AUTO_CLEAN, AUTO_CLEAN_COOLDOWN, AUTO_CLEAN_PERIOD_ENABLED, AUTO_CLEAN_PERIOD_MINUTES, LAST_PERIODIC_CLEAN
 	while not stop_event.is_set():
 		try:
 			mem = psutil.virtual_memory()
@@ -213,54 +312,31 @@ def update_loop(stop_event: threading.Event):
 			swap_text = f"Paging File: {swap.used / (1024**3):.2f} GB / {swap.total / (1024**3):.2f} GB ({swap.percent:.1f}%)"
 			ram_val = min(mem.percent / 100.0, 1.0)
 			swap_val = min(swap.percent / 100.0, 1.0)
-
-			# write texts
 			try:
 				dpg.set_value('ram_text', ram_text)
 				dpg.set_value('swap_text', swap_text)
+				dpg.set_value('ram_bar', ram_val)
+				dpg.set_value('swap_bar', swap_val)
+				# Set text color based on thresholds: >=80% red, >=60% orange, otherwise muted gray
+				ram_color = (180, 180, 180)
+				if mem.percent >= 80:
+					ram_color = (200, 60, 60)
+				elif mem.percent >= 60:
+					ram_color = (230, 130, 40)
+				swap_color = (180, 180, 180)
+				if swap.percent >= 80:
+					swap_color = (200, 60, 60)
+				elif swap.percent >= 60:
+					swap_color = (230, 130, 40)
+				try:
+					if dpg.does_item_exist('ram_text'):
+						dpg.configure_item('ram_text', color=ram_color)
+					if dpg.does_item_exist('swap_text'):
+						dpg.configure_item('swap_text', color=swap_color)
+				except Exception:
+					pass
 			except Exception:
 				pass
-
-			# draw custom colored bars (green/yellow/red)
-			try:
-				def color_for(pct):
-					if pct < 60:
-						return (80, 200, 120, 255)
-					if pct < 85:
-						return (240, 200, 80, 255)
-					return (220, 80, 80, 255)
-
-				w = 440
-				h = 18
-				# remove previous foreground rects if present
-				try:
-					if dpg.does_item_exist('ram_fore'):
-						dpg.delete_item('ram_fore')
-				except Exception:
-					pass
-				try:
-					if dpg.does_item_exist('swap_fore'):
-						dpg.delete_item('swap_fore')
-				except Exception:
-					pass
-
-				# draw background then foreground
-				try:
-					dpg.draw_rectangle((0, 0), (w, h), color=(60,60,60,255), fill=(40,40,40,255), parent='ram_draw', tag='ram_back')
-					fw = int(w * ram_val)
-					if fw > 0:
-						dpg.draw_rectangle((0, 0), (fw, h), color=color_for(mem.percent), fill=color_for(mem.percent), parent='ram_draw', tag='ram_fore')
-				except Exception:
-					pass
-
-				try:
-					dpg.draw_rectangle((0, 0), (w, h), color=(60,60,60,255), fill=(40,40,40,255), parent='swap_draw', tag='swap_back')
-					fw2 = int(w * swap_val)
-					if fw2 > 0:
-						dpg.draw_rectangle((0, 0), (fw2, h), color=color_for(swap.percent), fill=color_for(swap.percent), parent='swap_draw', tag='swap_fore')
-				except Exception:
-					pass
-
 			# update tray icon image if available
 			try:
 				if '_GLOBAL_TRAY_ICON' in globals() and _GLOBAL_TRAY_ICON:
@@ -268,73 +344,45 @@ def update_loop(stop_event: threading.Event):
 						img = create_tray_icon(mem.percent)
 						_GLOBAL_TRAY_ICON.icon = img
 						try:
+							# some pystray backends expose update_icon
 							_GLOBAL_TRAY_ICON.update_icon()
 						except Exception:
 							pass
-				except Exception:
-					pass
-
-			# maintain history for simple sparkline
-			try:
-				history_seconds = dpg.get_value('history_seconds') if dpg.does_item_exist('history_seconds') else 60
-				interval = dpg.get_value('update_interval_input') if dpg.does_item_exist('update_interval_input') else 1.0
-				maxlen = max(10, int(history_seconds / max(0.1, float(interval))))
-				_mem_history.append(mem.percent)
-				while len(_mem_history) > maxlen:
-					_mem_history.popleft()
-				# make a small sparkline using 8 levels
-				levels = '▁▂▃▄▅▆▇█'
-				line = ''.join(levels[min(len(levels)-1, int((v/100.0)*(len(levels)-1)))] for v in _mem_history)
-				dpg.set_value('history_text', f"History ({len(_mem_history)}s): {line}")
-			except Exception:
-				pass
-
-			# update processes list
-			try:
-				top_n = dpg.get_value('top_n_processes') if dpg.does_item_exist('top_n_processes') else 5
-				procs = []
-				for p in psutil.process_iter(['pid','name','memory_info']):
-					try:
-						mi = p.info.get('memory_info')
-						rss = getattr(mi, 'rss', 0) if mi else 0
-						procs.append((rss, p.info.get('name') or ''))
-				except Exception:
-					continue
-				procs.sort(reverse=True)
-				for i in range(min(10, max(1, top_n))):
-					try:
-						if i < len(procs):
-							rss, name = procs[i]
-							s = f"{i+1}. {name} — {rss/(1024**2):.1f} MB"
-							dpg.set_value(f'proc_row_{i}', s)
-						else:
-							dpg.set_value(f'proc_row_{i}', '')
 					except Exception:
 						pass
 			except Exception:
 				pass
-
-			# Auto-cleanup when threshold reached (with simple cooldown)
+			# Also update stored config values for threshold auto-clean if changed in GUI
 			try:
-				if dpg.does_item_exist('auto_cleanup_checkbox') and dpg.get_value('auto_cleanup_checkbox'):
-					threshold = dpg.get_value('auto_cleanup_threshold') if dpg.does_item_exist('auto_cleanup_threshold') else 90
-					now = time.time()
-					global _last_autoclean_time
-					if mem.percent >= float(threshold) and now - _last_autoclean_time > max(30.0, float(interval)*5):
-						_last_autoclean_time = now
-						threading.Thread(target=lambda: _autoclean_and_notify(), daemon=True).start()
+				if dpg.does_item_exist('autoclean_threshold_combo'):
+					val = dpg.get_value('autoclean_threshold_combo')
+					# combo stores strings like '50%'
+					if isinstance(val, str) and val.endswith('%'):
+						try:
+							vnum = int(val.rstrip('%'))
+							global AUTO_CLEAN_THRESHOLD, AUTO_CLEAN_ENABLED
+							AUTO_CLEAN_THRESHOLD = vnum
+							# if checkbox exists, keep AUTO_CLEAN_ENABLED in sync
+							if dpg.does_item_exist('autoclean_threshold_enable'):
+								AUTO_CLEAN_ENABLED = bool(dpg.get_value('autoclean_threshold_enable'))
+						except Exception:
+							pass
 			except Exception:
 				pass
-
 		except Exception:
 			pass
+		stop_event.wait(1.0)
 
-		# wait for configured interval
+		# Automatic cleaning if enabled and threshold reached (with cooldown)
 		try:
-			interval = float(dpg.get_value('update_interval_input')) if dpg.does_item_exist('update_interval_input') else 1.0
+			if AUTO_CLEAN_ENABLED and AUTO_CLEAN_THRESHOLD and mem.percent >= AUTO_CLEAN_THRESHOLD:
+				now = time.time()
+				if now - LAST_AUTO_CLEAN >= AUTO_CLEAN_COOLDOWN:
+					print(f"Auto-clean triggered: mem {mem.percent:.1f}% >= {AUTO_CLEAN_THRESHOLD}%")
+					threading.Thread(target=cleanup_memory, daemon=True).start()
+					LAST_AUTO_CLEAN = now
 		except Exception:
-			interval = 1.0
-		stop_event.wait(max(0.1, interval))
+			pass
 
 
 # Global tray icon instance
@@ -426,9 +474,9 @@ def install_close_hook() -> bool:
 
 def create_tray_icon(ram_percent):
 	"""Create tray icon with memory percentage"""
-	# larger icon for better readability in tray
+	# Restore larger icon size for clearer digits (128x128)
 	size = (128, 128)
-	img = Image.new('RGBA', size, color=(40, 40, 40, 255))
+	img = Image.new('RGB', size, color=(40, 40, 40))
 	draw = ImageDraw.Draw(img)
 
 	text = f"{int(ram_percent)}"
@@ -450,10 +498,16 @@ def create_tray_icon(ram_percent):
 		if font is None:
 			font = ImageFont.load_default()
 
-		draw.text((size[0]//2, size[1]//2), text, fill=(255, 255, 255, 255), anchor="mm", font=font)
+		# draw the percentage text (always)
+		draw.text((size[0]//2, size[1]//2), text, fill=(230, 230, 230), anchor="mm", font=font)
 	except Exception:
 		pass
 	
+	# Some pystray backends expect RGB images without alpha
+	try:
+		img = img.convert('RGB')
+	except Exception:
+		pass
 	return img
 
 
@@ -467,10 +521,50 @@ def on_tray_cleanup(icon, item):
 	threading.Thread(target=cleanup_memory, daemon=True).start()
 
 
+def on_tray_set_auto_clean(icon, item, threshold):
+	"""Set automatic cleaning threshold from tray submenu.
+
+	Passing threshold=0 disables auto-clean.
+	"""
+	try:
+		global AUTO_CLEAN_THRESHOLD, AUTO_CLEAN_ENABLED
+		if threshold and threshold >= 50:
+			AUTO_CLEAN_THRESHOLD = int(threshold)
+			AUTO_CLEAN_ENABLED = True
+		else:
+			AUTO_CLEAN_THRESHOLD = 0
+			AUTO_CLEAN_ENABLED = False
+		# persist to config
+		theme = dpg.get_value('theme_radio').lower() if dpg.does_item_exist('theme_radio') else 'blue'
+		autostart = dpg.get_value('autostart_checkbox') if dpg.does_item_exist('autostart_checkbox') else False
+		save_config(
+			autostart,
+			theme,
+			AUTO_CLEAN_ENABLED,
+			AUTO_CLEAN_THRESHOLD,
+			AUTO_CLEAN_PERIOD_ENABLED,
+			AUTO_CLEAN_PERIOD_MINUTES,
+		)
+		# feedback in console
+		print(f"Auto-clean {'enabled' if AUTO_CLEAN_ENABLED else 'disabled'}, threshold={AUTO_CLEAN_THRESHOLD}")
+	except Exception as e:
+		print('on_tray_set_auto_clean error:', e)
+
+
 def on_tray_exit(icon, item):
 	"""Exit application from tray"""
 	try:
-		save_config(dpg.get_value('autostart_checkbox') if dpg.does_item_exist('autostart_checkbox') else False)
+		theme = dpg.get_value('theme_radio').lower() if dpg.does_item_exist('theme_radio') else 'blue'
+		autostart = dpg.get_value('autostart_checkbox') if dpg.does_item_exist('autostart_checkbox') else False
+		global AUTO_CLEAN_ENABLED, AUTO_CLEAN_THRESHOLD, AUTO_CLEAN_PERIOD_ENABLED, AUTO_CLEAN_PERIOD_MINUTES
+		save_config(
+			autostart,
+			theme,
+			AUTO_CLEAN_ENABLED,
+			AUTO_CLEAN_THRESHOLD,
+			AUTO_CLEAN_PERIOD_ENABLED,
+			AUTO_CLEAN_PERIOD_MINUTES,
+		)
 	except Exception:
 		pass
 	try:
@@ -488,12 +582,27 @@ def setup_tray():
 	try:
 		mem = psutil.virtual_memory()
 		icon_img = create_tray_icon(mem.percent)
-		
-		menu = pystray.Menu(
-			pystray.MenuItem("Show", lambda icon, item: on_tray_show(icon, item)),
-			pystray.MenuItem("Clear Memory", lambda icon, item: on_tray_cleanup(icon, item)),
-			pystray.MenuItem("Exit", lambda icon, item: on_tray_exit(icon, item))
-		)
+		# Build auto-clean submenu (50..100 step 5) with Off option.
+		# If submenu construction fails for any backend, fall back to a simple menu.
+		try:
+			cfg = load_config()
+			th_items = [pystray.MenuItem('Off', lambda icon, item: on_tray_set_auto_clean(icon, item, 0))]
+			for val in range(50, 101, 5):
+				# capture val in default arg
+				th_items.append(pystray.MenuItem(f"{val}%", (lambda v: (lambda icon, item: on_tray_set_auto_clean(icon, item, v)))(val)))
+			menu = pystray.Menu(
+				pystray.MenuItem("Show", lambda icon, item: on_tray_show(icon, item)),
+				pystray.MenuItem("Clear Memory", lambda icon, item: on_tray_cleanup(icon, item)),
+				pystray.MenuItem("Очистка при заполнении", pystray.Menu(*th_items)),
+				pystray.MenuItem("Exit", lambda icon, item: on_tray_exit(icon, item))
+			)
+		except Exception as e:
+			print('Tray submenu build failed, falling back to simple menu:', e)
+			menu = pystray.Menu(
+				pystray.MenuItem("Show", lambda icon, item: on_tray_show(icon, item)),
+				pystray.MenuItem("Clear Memory", lambda icon, item: on_tray_cleanup(icon, item)),
+				pystray.MenuItem("Exit", lambda icon, item: on_tray_exit(icon, item))
+			)
 		
 		tray_icon = pystray.Icon("Memory Monitor", icon_img, menu=menu)
 		# expose global reference so other threads can update the icon
@@ -503,27 +612,6 @@ def setup_tray():
 	except Exception as e:
 		print(f'Tray setup error: {e}')
 		return None
-
-
-def _autoclean_and_notify():
-	"""Call cleanup_memory and show an in-app notification if enabled."""
-	try:
-		res = cleanup_memory()
-		# show transient notification in GUI if requested
-		try:
-			if dpg.does_item_exist('notify_on_cleanup') and dpg.get_value('notify_on_cleanup'):
-				if dpg.does_item_exist('notify_win'):
-					dpg.delete_item('notify_win')
-				dpg.add_window(label='Notification', tag='notify_win', pos=(260, 20), width=200, height=60, no_close=True)
-				dpg.add_text('Memory cleaned', parent='notify_win')
-				# schedule removal
-				threading.Timer(4.0, lambda: dpg.delete_item('notify_win') if dpg.does_item_exist('notify_win') else None).start()
-		except Exception:
-			pass
-		return res
-	except Exception as e:
-		print(f'_autoclean_and_notify error: {e}')
-		return False
 
 
 def run_tray(tray_icon):
@@ -546,8 +634,25 @@ def open_settings():
 def main():
 	dpg.create_context()
 	
-	# Load config and set up fonts with larger size
+	# Load config and create themes
 	cfg = load_config()
+	themes = create_themes()
+	
+	# Apply saved theme
+	saved_theme = cfg.get('theme', 'blue')
+	if saved_theme in themes:
+		dpg.bind_theme(themes[saved_theme])
+		print(f'Loaded theme from config: {saved_theme}')
+
+	# Restore auto-clean settings from config into globals
+	global AUTO_CLEAN_ENABLED, AUTO_CLEAN_THRESHOLD, AUTO_CLEAN_PERIOD_ENABLED, AUTO_CLEAN_PERIOD_MINUTES
+	try:
+		AUTO_CLEAN_ENABLED = bool(cfg.get('auto_clean_enabled', False))
+		AUTO_CLEAN_THRESHOLD = int(cfg.get('auto_clean_threshold', 0))
+		AUTO_CLEAN_PERIOD_ENABLED = bool(cfg.get('auto_clean_period_enabled', False))
+		AUTO_CLEAN_PERIOD_MINUTES = int(cfg.get('auto_clean_period_minutes', 60))
+	except Exception:
+		pass
 	
 	# Register and bind a larger font for better readability
 	try:
@@ -576,23 +681,22 @@ def main():
 	print('DEBUG: created viewport')
 
 	with dpg.window(label='Memory Monitor', tag='main_window', width=460, height=270, pos=(10, 10)):
-		# Tab bar with Main and Settings tabs
+		# Tab bar with Main, Settings and Style tabs
 		with dpg.tab_bar():
 			with dpg.tab(label='Main'):
 				dpg.add_spacer(height=5)
-				dpg.add_text('', tag='ram_text', color=(100, 200, 255))
-				# custom drawing bar so we can change color dynamically
-				dpg.add_drawing(tag='ram_draw', width=440, height=18)
+				dpg.add_text('', tag='ram_text', color=(180, 180, 180))
+				dpg.add_progress_bar(tag='ram_bar', width=440, default_value=0.0)
 				dpg.add_spacer(height=8)
-				dpg.add_text('', tag='swap_text', color=(100, 200, 255))
-				dpg.add_drawing(tag='swap_draw', width=440, height=18)
+				dpg.add_text('', tag='swap_text', color=(180, 180, 180))
+				dpg.add_progress_bar(tag='swap_bar', width=440, default_value=0.0)
 				dpg.add_spacer(height=12)
-				# History sparkline (text-based for compatibility)
-				dpg.add_text('', tag='history_text', color=(200,200,200))
+				
 				# Clear Memory button
 				with dpg.group(horizontal=True):
 					dpg.add_spacer(width=130)
 					dpg.add_button(label='Clear Memory', width=180, height=32, callback=lambda: threading.Thread(target=cleanup_memory, daemon=True).start())
+				
 				# License text
 				dpg.add_spacer(height=6)
 				dpg.add_text('License: Free distribution', color=(160, 160, 160))
@@ -602,28 +706,35 @@ def main():
 				dpg.add_text('System', color=(200, 200, 200))
 				dpg.add_separator()
 				dpg.add_checkbox(label='Autostart on System Boot', tag='autostart_checkbox', default_value=cfg.get('autostart', False), callback=lambda s, v: set_autostart(v))
-				dpg.add_spacing(count=1)
-				dpg.add_text('Appearance', color=(200,200,200))
-				dpg.add_color_picker4(tag='accent_color_picker', label='Accent Color', default_value=cfg.get('accent_color', [100,200,255,255]), width=200)
-				dpg.add_spacing(count=1)
-				dpg.add_text('Update', color=(200,200,200))
-				dpg.add_input_float(tag='update_interval_input', label='Update interval (s)', default_value=cfg.get('update_interval', 1.0), min_value=0.1, step=0.1)
-				dpg.add_spacing(count=1)
-				dpg.add_text('Auto Cleanup', color=(200,200,200))
-				dpg.add_checkbox(tag='auto_cleanup_checkbox', label='Enable auto cleanup', default_value=cfg.get('auto_cleanup', False))
-				dpg.add_slider_int(tag='auto_cleanup_threshold', label='Cleanup threshold (%)', default_value=cfg.get('auto_cleanup_threshold', 90), min_value=10, max_value=100)
-				dpg.add_checkbox(tag='notify_on_cleanup', label='Notify on cleanup', default_value=cfg.get('notify_on_cleanup', True))
-				dpg.add_spacing(count=1)
-				dpg.add_text('History / Processes', color=(200,200,200))
-				dpg.add_input_int(tag='history_seconds', label='History length (s)', default_value=cfg.get('history_seconds', 60), min_value=10, max_value=3600)
-				dpg.add_input_int(tag='top_n_processes', label='Top N processes', default_value=cfg.get('top_n_processes', 5), min_value=1, max_value=50)
-				dpg.add_spacing(count=1)
-				dpg.add_button(label='Save settings', callback=lambda: save_config(dpg.get_value('autostart_checkbox') if dpg.does_item_exist('autostart_checkbox') else False))
-				
-			with dpg.tab(label='Processes', tag='processes_tab'):
-				dpg.add_text('Top memory consuming processes:', color=(220,220,220))
-				for i in range(10):
-					dpg.add_text('', tag=f'proc_row_{i}')
+				# Auto-clean on threshold controls
+				dpg.add_spacer(height=6)
+				dpg.add_text('Auto-clean on threshold', color=(200,200,200))
+				dpg.add_checkbox(label='Enable auto-clean when memory exceeds threshold', tag='autoclean_threshold_enable', default_value=cfg.get('auto_clean_enabled', False), callback=lambda s, v: [set_autostart(dpg.get_value('autostart_checkbox')) if False else None])
+				# threshold combo (50..100 step 5)
+				threshold_items = [f"{v}%" for v in range(50, 101, 5)]
+				dpg.add_combo(items=threshold_items, tag='autoclean_threshold_combo', default_value=(str(cfg.get('auto_clean_threshold', 0)) + '%' if cfg.get('auto_clean_threshold', 0) else '50%'), width=200)
+				dpg.add_button(label='Apply threshold', width=120, callback=lambda s, a: on_tray_set_auto_clean(None, None, int(dpg.get_value('autoclean_threshold_combo').rstrip('%')) if isinstance(dpg.get_value('autoclean_threshold_combo'), str) else 0))
+		
+				# Periodic auto-clean controls
+				dpg.add_spacer(height=8)
+				dpg.add_text('Periodic auto-clean', color=(200,200,200))
+				dpg.add_checkbox(label='Enable periodic auto-clean', tag='autoclean_periodic_enable', default_value=cfg.get('auto_clean_period_enabled', False), callback=lambda s, v: None)
+				dpg.add_input_int(label='Interval (minutes)', tag='autoclean_period_minutes', default_value=cfg.get('auto_clean_period_minutes', 60), min_value=1, max_value=1440, width=120)
+				dpg.add_button(label='Run periodic now', width=140, callback=lambda: threading.Thread(target=cleanup_memory, daemon=True).start())
+			
+			with dpg.tab(label='Style', tag='style_tab'):
+				dpg.add_spacer(height=10)
+				dpg.add_text('Application Theme', color=(200, 200, 200))
+				dpg.add_separator()
+				dpg.add_spacer(height=8)
+				dpg.add_radio_button(
+					items=['Green', 'Purple', 'Blue', 'Yellow'],
+					tag='theme_radio',
+					default_value=cfg.get('theme', 'blue').capitalize(),
+					callback=lambda s, v: apply_theme(v.lower(), themes)
+				)
+				dpg.add_spacer(height=10)
+				dpg.add_text('Theme changes are applied immediately', color=(160, 160, 160))
 
 	dpg.setup_dearpygui()
 	dpg.set_primary_window('main_window', True)
@@ -713,12 +824,33 @@ def main():
 	t.start()
 	print('DEBUG: update_loop thread started')
 
+	# Periodic auto-clean thread: checks interval and triggers cleanup
+	def periodic_clean_loop(stop_event: threading.Event):
+		global AUTO_CLEAN_PERIOD_ENABLED, AUTO_CLEAN_PERIOD_MINUTES, LAST_PERIODIC_CLEAN
+		while not stop_event.is_set():
+			try:
+				if AUTO_CLEAN_PERIOD_ENABLED and AUTO_CLEAN_PERIOD_MINUTES and AUTO_CLEAN_PERIOD_MINUTES > 0:
+					now = time.time()
+					if now - LAST_PERIODIC_CLEAN >= (AUTO_CLEAN_PERIOD_MINUTES * 60):
+						print(f'Periodic auto-clean triggered (every {AUTO_CLEAN_PERIOD_MINUTES} min)')
+						threading.Thread(target=cleanup_memory, daemon=True).start()
+						LAST_PERIODIC_CLEAN = now
+			except Exception:
+				pass
+			stop_event.wait(5.0)
+
+	periodic_thread = threading.Thread(target=periodic_clean_loop, args=(stop_event,), daemon=True)
+	periodic_thread.start()
+	print('DEBUG: periodic_clean_loop thread started')
+
 	print('DEBUG: starting DearPyGui main loop')
 	dpg.start_dearpygui()
 
 	# Cleanup on exit
 	stop_event.set()
-	save_config(dpg.get_value('autostart_checkbox') if dpg.does_item_exist('autostart_checkbox') else False)
+	theme = dpg.get_value('theme_radio').lower() if dpg.does_item_exist('theme_radio') else cfg.get('theme', 'blue')
+	autostart = dpg.get_value('autostart_checkbox') if dpg.does_item_exist('autostart_checkbox') else False
+	save_config(autostart, theme)
 	dpg.destroy_context()
 
 
